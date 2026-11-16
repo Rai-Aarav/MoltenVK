@@ -1205,7 +1205,7 @@ MTLRenderPipelineDescriptor* MVKGraphicsPipeline::newMTLRenderPipelineDescriptor
 	if (!addFragmentShaderToPipeline(plDesc, pCreateInfo, shaderConfig, vtxOutputs, pFragmentSS, pFragmentFB)) { return nil; }
 
 	// Output
-	addFragmentOutputToPipeline(plDesc, pCreateInfo);
+	addFragmentOutputToPipeline(plDesc, pCreateInfo, pFragmentSS);
 
 	// Metal does not allow the name of the pipeline to be changed after it has been created,
 	// and we need to create the Metal pipeline immediately to provide error feedback to app.
@@ -1385,7 +1385,7 @@ MTLRenderPipelineDescriptor* MVKGraphicsPipeline::newMTLTessRasterStageDescripto
 	addTessellationToPipeline(plDesc, reflectData, pCreateInfo->pTessellationState);
 
 	// Output
-	addFragmentOutputToPipeline(plDesc, pCreateInfo);
+	addFragmentOutputToPipeline(plDesc, pCreateInfo, pFragmentSS);
 
 	return plDesc;
 }
@@ -1974,10 +1974,22 @@ void MVKGraphicsPipeline::addTessellationToPipeline(MTLRenderPipelineDescriptor*
 }
 
 void MVKGraphicsPipeline::addFragmentOutputToPipeline(MTLRenderPipelineDescriptor* plDesc,
-													  const VkGraphicsPipelineCreateInfo* pCreateInfo) {
+													  const VkGraphicsPipelineCreateInfo* pCreateInfo,
+													  const VkPipelineShaderStageCreateInfo* pFragmentSS) {
 	// Topology
 	if (pCreateInfo->pInputAssemblyState)
 		plDesc.inputPrimitiveTopology = getPrimitiveTopologyClass();
+
+	// Reflect the fragment shader outputs, to detect a color attachment whose numeric kind does
+	// not match the fragment shader output that writes to it. This is invalid Vulkan usage that
+	// desktop drivers tolerate, but that causes Metal to reject the pipeline.
+	SPIRVShaderOutputs fragOutputs;
+	if (_isRasterizingColor && pFragmentSS && _fragmentModule) {
+		std::string errorLog;
+		if ( !getShaderOutputs(_fragmentModule->getSPIRV(), spv::ExecutionModelFragment, pFragmentSS->pName, fragOutputs, errorLog) ) {
+			fragOutputs.clear();
+		}
+	}
 
 	const VkPipelineRenderingCreateInfo* pRendInfo = getRenderingCreateInfo(pCreateInfo);
 
@@ -1991,6 +2003,30 @@ void MVKGraphicsPipeline::addFragmentOutputToPipeline(MTLRenderPipelineDescripto
 
 			VkFormat attachFmt = pRendInfo->pColorAttachmentFormats[caIdx];
 			MTLPixelFormat mtlPixFmt = getPixelFormats()->getMTLPixelFormat(attachFmt);
+
+			// If the fragment shader writes a floating point value to an unsigned integer attachment,
+			// or the reverse, describe the attachment to Metal using a format of the kind the shader
+			// writes, and the same size, so that the pipeline can be created.
+			for (const auto& fo : fragOutputs) {
+				if (fo.builtin != spv::BuiltInMax || fo.location != caLoc || !mtlPixFmt) { continue; }
+				MVKFormatType fmtType = getPixelFormats()->getFormatType(mtlPixFmt);
+				bool isFloatFmt = (fmtType == kMVKFormatColorHalf || fmtType == kMVKFormatColorFloat);
+				bool isUIntFmt = (fmtType == kMVKFormatColorUInt8 || fmtType == kMVKFormatColorUInt16 || fmtType == kMVKFormatColorUInt32);
+				uint32_t fmtSize = getPixelFormats()->getBytesPerBlock(attachFmt);
+				MTLPixelFormat altPixFmt = MTLPixelFormatInvalid;
+				if (fo.baseType == SPIRType::Float && isUIntFmt) {
+					altPixFmt = fmtSize == 4 ? MTLPixelFormatR32Float : fmtSize == 8 ? MTLPixelFormatRG32Float : fmtSize == 16 ? MTLPixelFormatRGBA32Float : MTLPixelFormatInvalid;
+				} else if (fo.baseType == SPIRType::UInt && isFloatFmt) {
+					altPixFmt = fmtSize == 4 ? MTLPixelFormatR32Uint : fmtSize == 8 ? MTLPixelFormatRG32Uint : fmtSize == 16 ? MTLPixelFormatRGBA32Uint : MTLPixelFormatInvalid;
+				}
+				if (altPixFmt != MTLPixelFormatInvalid) {
+					reportMessage(MVK_CONFIG_LOG_LEVEL_WARNING, "Fragment shader output %u does not match the numeric kind of color attachment format %s. Describing the attachment as %s instead.",
+								  caLoc, getPixelFormats()->getName(attachFmt), getPixelFormats()->getName(altPixFmt));
+					mtlPixFmt = altPixFmt;
+				}
+				break;
+			}
+
 			bool supportsBlend = getPixelFormats()->getCapabilities(mtlPixFmt) & kMVKMTLFmtCapsBlend;
 			MTLRenderPipelineColorAttachmentDescriptor* colorDesc = plDesc.colorAttachments[caLoc];
             colorDesc.pixelFormat = mtlPixFmt;
