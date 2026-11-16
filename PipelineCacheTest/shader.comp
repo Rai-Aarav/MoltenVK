@@ -1,0 +1,83 @@
+#version 450
+// Compute shader used to exercise the MoltenVK pipeline cache. The constant SEED is located
+// in the compiled SPIR-V and replaced at runtime to produce many distinct shader modules.
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0) buffer Result { uint value[]; } result;
+
+const uint SEED = 0x5EEDC0DEu;
+
+uint hash(uint x) {
+	x ^= x >> 16; x *= 0x7feb352du;
+	x ^= x >> 15; x *= 0x846ca68bu;
+	x ^= x >> 16;
+	return x;
+}
+
+float noise(vec3 p, uint s) {
+	vec3 i = floor(p);
+	vec3 f = fract(p);
+	f = f * f * (3.0 - 2.0 * f);
+	uint n = uint(i.x) + uint(i.y) * 57u + uint(i.z) * 113u + s;
+	float a = float(hash(n) & 0xffffu) / 65535.0;
+	float b = float(hash(n + 1u) & 0xffffu) / 65535.0;
+	float c = float(hash(n + 57u) & 0xffffu) / 65535.0;
+	float d = float(hash(n + 58u) & 0xffffu) / 65535.0;
+	float e = float(hash(n + 113u) & 0xffffu) / 65535.0;
+	float g = float(hash(n + 114u) & 0xffffu) / 65535.0;
+	float h = float(hash(n + 170u) & 0xffffu) / 65535.0;
+	float k = float(hash(n + 171u) & 0xffffu) / 65535.0;
+	return mix(mix(mix(a, b, f.x), mix(c, d, f.x), f.y), mix(mix(e, g, f.x), mix(h, k, f.x), f.y), f.z);
+}
+
+float fbm(vec3 p, uint s) {
+	float sum = 0.0;
+	float amp = 0.5;
+	for (int i = 0; i < 6; i++) {
+		sum += amp * noise(p, s + uint(i));
+		p = p * 2.02 + vec3(1.7, 9.2, 3.1);
+		amp *= 0.5;
+	}
+	return sum;
+}
+
+mat3 rotation(vec3 axis, float angle) {
+	axis = normalize(axis);
+	float s = sin(angle);
+	float c = cos(angle);
+	float oc = 1.0 - c;
+	return mat3(oc * axis.x * axis.x + c,          oc * axis.x * axis.y - axis.z * s, oc * axis.z * axis.x + axis.y * s,
+				oc * axis.x * axis.y + axis.z * s, oc * axis.y * axis.y + c,          oc * axis.y * axis.z - axis.x * s,
+				oc * axis.z * axis.x - axis.y * s, oc * axis.y * axis.z + axis.x * s, oc * axis.z * axis.z + c);
+}
+
+float scene(vec3 p, uint s) {
+	float d = length(p) - 1.0;
+	for (int i = 0; i < 4; i++) {
+		p = rotation(vec3(0.3, 0.5 + float(i), 0.7), 0.37 * float(i + 1)) * p;
+		d = min(d, length(max(abs(p) - vec3(0.4, 0.3, 0.2), 0.0)) - 0.05 * fbm(p * 3.0, s));
+		p = abs(p) - vec3(0.25);
+	}
+	return d;
+}
+
+vec3 shade(vec3 ro, vec3 rd, uint s) {
+	float t = 0.0;
+	vec3 col = vec3(0.0);
+	for (int i = 0; i < 16; i++) {
+		vec3 p = ro + rd * t;
+		float d = scene(p, s);
+		vec2 e = vec2(0.001, 0.0);
+		vec3 n = normalize(vec3(scene(p + e.xyy, s) - d, scene(p + e.yxy, s) - d, scene(p + e.yyx, s) - d));
+		col += vec3(fbm(n * 4.0, s), fbm(p, s + 7u), max(dot(n, vec3(0.57)), 0.0)) / (1.0 + t * t);
+		t += max(d, 0.01);
+	}
+	return col;
+}
+
+void main() {
+	// The value written is independent of the heavier code above, so that it can be verified exactly.
+	uint idx = gl_GlobalInvocationID.x;
+	vec3 col = shade(vec3(0.0, 0.0, -3.0), normalize(vec3(float(idx) * 0.01, 0.1, 1.0)), SEED);
+	uint noiseBits = (col.x + col.y + col.z) < -1.0 ? 1u : 0u;		// Always zero.
+	result.value[idx] = hash(SEED + idx) + noiseBits;
+}
