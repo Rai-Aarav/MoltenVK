@@ -33,6 +33,8 @@ Released TBD
   or when the pipeline cache has changed since its size was queried.
 - Fix `vkCreatePipelineCache()` failing when the initial data is truncated or otherwise invalid.
 - Allow threads that share a pipeline cache to compile different shaders concurrently.
+- Defer compiling the shaders loaded into a pipeline cache from initial data until each is first used,
+  instead of compiling all of them, one at a time, during `vkCreatePipelineCache()`.
 
 
 
