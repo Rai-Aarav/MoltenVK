@@ -1,7 +1,7 @@
 // Exercises the MoltenVK pipeline cache: retrieving cache data, reloading it, and creating
 // pipelines from several threads that share one pipeline cache. Links against libMoltenVK directly.
 //
-// Usage: pipeline_cache_test [shaderCount] [threadCount]
+// Usage: pipeline_cache_test [shaderCount] [threadCount] [save|load <file>]
 //
 // Each run perturbs the shaders with a new seed, so that neither Metal's own shader cache,
 // nor results left behind by an earlier run, affect the timings.
@@ -154,7 +154,8 @@ static void initContext(Context& ctx) {
 }
 
 // Creates a set of shader modules that differ from each other, and from those of any other run.
-static std::vector<VkShaderModule> createShaderModules(Context& ctx, uint32_t count, std::vector<uint32_t>& seeds) {
+static std::vector<VkShaderModule> createShaderModules(Context& ctx, uint32_t count, std::vector<uint32_t>& seeds,
+													   const uint32_t* pBaseSeed = nullptr) {
 	std::random_device rd;
 	std::vector<VkShaderModule> modules(count);
 	seeds.resize(count);
@@ -165,7 +166,7 @@ static std::vector<VkShaderModule> createShaderModules(Context& ctx, uint32_t co
 	}
 	REQUIRE(seedPositions.size() == 1, "expected exactly one seed constant in the SPIR-V");
 
-	uint32_t baseSeed = rd();
+	uint32_t baseSeed = pBaseSeed ? *pBaseSeed : rd();
 	for (uint32_t i = 0; i < count; i++) {
 		seeds[i] = baseSeed + i * 7919u;
 		code[seedPositions[0]] = seeds[i];
@@ -280,6 +281,74 @@ static bool runAndVerify(Context& ctx, VkPipeline pipeline, uint32_t seed) {
 	return ok;
 }
 
+// Populates a pipeline cache in this process, and saves its data, along with the seed of the shaders, to a file.
+static int saveCacheFile(Context& ctx, uint32_t shaderCount, uint32_t threadCount, const char* path) {
+	std::random_device rd;
+	uint32_t baseSeed = rd();
+	std::vector<uint32_t> seeds;
+	auto modules = createShaderModules(ctx, shaderCount, seeds, &baseSeed);
+	VkPipelineCache cache = createCache(ctx);
+	auto batch = createPipelines(ctx, cache, modules, threadCount);
+	CHECK(batch.failures == 0, "%u threads: %u pipelines in %.2f s", threadCount, shaderCount, batch.seconds);
+	printf("RESULT populate_seconds %.2f\n", batch.seconds);
+
+	size_t size = 0;
+	vkGetPipelineCacheData(ctx.device, cache, &size, nullptr);
+	std::vector<uint8_t> data(size);
+	VkResult rslt = vkGetPipelineCacheData(ctx.device, cache, &size, data.data());
+	CHECK(rslt == VK_SUCCESS && size == data.size(), "retrieved %zu bytes of cache data", size);
+
+	FILE* f = fopen(path, "wb");
+	REQUIRE(f, "could not open the cache file for writing");
+	fwrite(&baseSeed, sizeof(baseSeed), 1, f);
+	fwrite(&shaderCount, sizeof(shaderCount), 1, f);
+	fwrite(data.data(), 1, data.size(), f);
+	fclose(f);
+	printf("RESULT failures %d\n", failureCount);
+	return failureCount ? 1 : 0;
+}
+
+// Loads pipeline cache data that was saved by an earlier process, as an app does when it is restarted,
+// and creates pipelines for the first usedCount of the shaders in it.
+static int loadCacheFile(Context& ctx, uint32_t usedCount, uint32_t threadCount, const char* path) {
+	FILE* f = fopen(path, "rb");
+	REQUIRE(f, "could not open the cache file for reading");
+	uint32_t baseSeed = 0, shaderCount = 0;
+	REQUIRE(fread(&baseSeed, sizeof(baseSeed), 1, f) == 1 && fread(&shaderCount, sizeof(shaderCount), 1, f) == 1, "cache file header");
+	std::vector<uint8_t> data;
+	uint8_t chunk[65536];
+	for (size_t n; (n = fread(chunk, 1, sizeof(chunk), f)) > 0; ) { data.insert(data.end(), chunk, chunk + n); }
+	fclose(f);
+	if (usedCount == 0 || usedCount > shaderCount) { usedCount = shaderCount; }
+
+	std::vector<uint32_t> seeds;
+	auto modules = createShaderModules(ctx, usedCount, seeds, &baseSeed);
+
+	double start = now();
+	VkPipelineCache cache = createCache(ctx, data.data(), data.size());
+	double loadSeconds = now() - start;
+	printf("  INFO: vkCreatePipelineCache with %zu bytes for %u shaders took %.3f s\n", data.size(), shaderCount, loadSeconds);
+
+	auto batch = createPipelines(ctx, cache, modules, threadCount);
+	CHECK(batch.failures == 0, "%u threads: %u pipelines from the loaded cache in %.2f s", threadCount, usedCount, batch.seconds);
+	CHECK(batch.stageCacheHits == usedCount, "all shaders reported as pipeline cache hits (%u of %u)", batch.stageCacheHits, usedCount);
+	bool allCorrect = true;
+	for (uint32_t i = 0; i < usedCount; i += (usedCount / 8 ? usedCount / 8 : 1)) {
+		allCorrect = allCorrect && runAndVerify(ctx, batch.pipelines[i], seeds[i]);
+	}
+	CHECK(allCorrect, "pipelines created from the loaded cache produce correct results");
+
+	size_t size = 0;
+	vkGetPipelineCacheData(ctx.device, cache, &size, nullptr);
+	CHECK(size == data.size(), "loaded cache saves the same amount of data (%zu bytes)", size);
+
+	printf("RESULT cache_load_seconds %.3f\n", loadSeconds);
+	printf("RESULT cached_pipelines_seconds %.3f\n", batch.seconds);
+	printf("RESULT cache_load_plus_pipelines_seconds %.3f\n", loadSeconds + batch.seconds);
+	printf("RESULT failures %d\n", failureCount);
+	return failureCount ? 1 : 0;
+}
+
 int main(int argc, char** argv) {
 	uint32_t shaderCount = argc > 1 ? (uint32_t)atoi(argv[1]) : 192;
 	uint32_t threadCount = argc > 2 ? (uint32_t)atoi(argv[2]) : 8;
@@ -288,6 +357,11 @@ int main(int argc, char** argv) {
 	Context ctx;
 	initContext(ctx);
 	printf("Shaders: %u, threads: %u\n", shaderCount, threadCount);
+
+	// pipeline_cache_test <shaderCount> <threadCount> save <file>
+	// pipeline_cache_test <usedShaderCount, or 0 for all> <threadCount> load <file>
+	if (argc > 4 && strcmp(argv[3], "save") == 0) { return saveCacheFile(ctx, shaderCount, threadCount, argv[4]); }
+	if (argc > 4 && strcmp(argv[3], "load") == 0) { return loadCacheFile(ctx, shaderCount, threadCount, argv[4]); }
 
 	std::vector<uint8_t> cacheData;
 
