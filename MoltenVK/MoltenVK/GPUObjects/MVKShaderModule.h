@@ -118,11 +118,15 @@ public:
 	/**
 	 * When specializationMacroDef is not null, creates a macro-specialized library
 	 * specializationMacroDef contains (specialization id, value) mappings, should be sorted
+	 *
+	 * When deferCompilation is true, the MSL is not compiled until the first time a Metal
+	 * function is requested from this library. This cannot be combined with specializationMacroDef.
 	 */
 	MVKShaderLibrary(MVKVulkanAPIDeviceObject* owner,
 					 const mvk::SPIRVToMSLConversionResultInfo& resultInfo,
 					 const MVKCompressor<std::string> compressedMSL,
-					 const std::vector<std::pair<uint32_t, MVKShaderMacroValue>>* specializationMacroDef = nullptr);
+					 const std::vector<std::pair<uint32_t, MVKShaderMacroValue>>* specializationMacroDef = nullptr,
+					 bool deferCompilation = false);
 
 	MVKShaderLibrary(MVKVulkanAPIDeviceObject* owner,
 					 const void* mslCompiledCodeData,
@@ -142,6 +146,7 @@ protected:
 	MVKMTLFunction getMTLFunction(const VkSpecializationInfo* pSpecializationInfo,
 								  VkPipelineCreationFeedback* pShaderFeedback,
 								  MVKShaderModule* shaderModule);
+	id<MTLLibrary> getMTLLibrary();
 	void handleCompilationError(NSError* err, const char* opDesc);
     MTLFunctionConstant* getFunctionConstant(NSArray<MTLFunctionConstant*>* mtlFCs, NSUInteger mtlFCID);
 	void compileLibrary(const std::string& msl,
@@ -154,6 +159,11 @@ protected:
 	id<MTLLibrary> _mtlLibrary;
 	MVKCompressor<std::string> _compressedMSL;
 	mvk::SPIRVToMSLConversionResultInfo _shaderConversionResultInfo;
+
+	/** Guards _mtlLibrary and _isCompilationDeferred while compilation of the MSL is deferred. */
+	mutable std::mutex _compileLock;
+	/** When true, the MSL in _compressedMSL has not been compiled into _mtlLibrary yet. */
+	bool _isCompilationDeferred = false;
 
 	/** When true, representing a library created with source, but never specialized */
 	bool _maySpecializeWithMacro;
